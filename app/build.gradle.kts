@@ -24,3 +24,7 @@ android {
         jvmTarget = "17"
     }
 }
+
+dependencies {
+    implementation("org.opencv:opencv:4.11.0")
+}
