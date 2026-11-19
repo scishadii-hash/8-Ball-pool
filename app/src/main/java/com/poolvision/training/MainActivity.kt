@@ -119,6 +119,10 @@ class MainActivity : Activity() {
             stopService(Intent(this@MainActivity, AimOverlayService::class.java))
         })
 
+        root.addView(bigButton("تحليل صورة تدريب تلقائياً", Color.rgb(110, 75, 190)) {
+            startActivity(Intent(this@MainActivity, ImageAnalyzerActivity::class.java))
+        })
+
         root.addView(label("الإعدادات", 20f, Color.WHITE))
         addSlider(root, "الشفافية", "alpha", 40, 255, 200)
         addSlider(root, "حجم الكرة", "radius", 8, 30, 14)
