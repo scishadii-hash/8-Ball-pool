@@ -1,104 +1,435 @@
 package com.poolvision.training
 
 import android.app.Service
+import android.content.Context
 import android.content.Intent
-import android.graphics.*
+import android.graphics.Canvas
+import android.graphics.Color
+import android.graphics.DashPathEffect
+import android.graphics.Paint
+import android.graphics.PixelFormat
+import android.graphics.PointF
+import android.graphics.RectF
+import android.graphics.drawable.GradientDrawable
 import android.os.IBinder
-import android.view.*
-import android.widget.Toast
+import android.provider.Settings
+import android.view.Gravity
+import android.view.MotionEvent
+import android.view.View
+import android.view.WindowManager
+import android.widget.LinearLayout
+import android.widget.TextView
 import kotlin.math.hypot
+import kotlin.math.max
+import kotlin.math.min
+import kotlin.math.sqrt
+
+private const val EPS = 1e-6f
 
 class AimOverlayService : Service() {
-    private lateinit var windowManager: WindowManager
-    private var overlay: AimView? = null
 
-    override fun onCreate() {
-        super.onCreate()
-        windowManager = getSystemService(WINDOW_SERVICE) as WindowManager
-        overlay = AimView()
-        val params = WindowManager.LayoutParams(
-            WindowManager.LayoutParams.MATCH_PARENT,
-            WindowManager.LayoutParams.MATCH_PARENT,
-            WindowManager.LayoutParams.TYPE_APPLICATION_OVERLAY,
-            WindowManager.LayoutParams.FLAG_NOT_FOCUSABLE or
-                WindowManager.LayoutParams.FLAG_LAYOUT_IN_SCREEN,
-            PixelFormat.TRANSLUCENT
-        ).apply {
-            gravity = Gravity.TOP or Gravity.START
-        }
-        windowManager.addView(overlay, params)
-        Toast.makeText(this, "Pool Vision overlay active. Drag the handles; tap CLOSE to exit.", Toast.LENGTH_LONG).show()
-    }
-
-    override fun onDestroy() {
-        overlay?.let { windowManager.removeView(it) }
-        overlay = null
-        super.onDestroy()
-    }
+    private var wm: WindowManager? = null
+    private var canvasView: AimCanvasView? = null
+    private var panelView: View? = null
+    private var editing = true
 
     override fun onBind(intent: Intent?): IBinder? = null
 
-    inner class AimView : View(this@AimOverlayService) {
-        private val linePaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
-            color = Color.rgb(56, 214, 176); strokeWidth = 5f; style = Paint.Style.STROKE
-        }
-        private val targetPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
-            color = Color.rgb(255, 209, 102); strokeWidth = 4f; style = Paint.Style.STROKE
-        }
-        private val handlePaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
-            color = Color.WHITE; style = Paint.Style.FILL
-        }
-        private val labelPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
-            color = Color.WHITE; textSize = 34f; typeface = Typeface.create("sans-serif-medium", Typeface.BOLD)
-        }
-        private var cue = PointF(180f, 600f)
-        private var target = PointF(600f, 400f)
-        private var active = 0
-        private val radius = 25f
-        private val closeRect = RectF(30f, 70f, 210f, 135f)
+    private fun canvasFlags(edit: Boolean): Int {
+        var f = WindowManager.LayoutParams.FLAG_NOT_FOCUSABLE or
+            WindowManager.LayoutParams.FLAG_LAYOUT_IN_SCREEN or
+            WindowManager.LayoutParams.FLAG_LAYOUT_NO_LIMITS
+        if (!edit) f = f or WindowManager.LayoutParams.FLAG_NOT_TOUCHABLE
+        return f
+    }
 
-        override fun onDraw(canvas: Canvas) {
-            super.onDraw(canvas)
-            // Light translucent labels; the rest of the view stays transparent.
-            val bg = Paint(Paint.ANTI_ALIAS_FLAG).apply { color = 0x990A121D.toInt() }
-            canvas.drawRoundRect(closeRect, 18f, 18f, bg)
-            canvas.drawText("CLOSE", 72f, 113f, labelPaint)
+    override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
+        if (canvasView != null) return START_NOT_STICKY
+        if (!Settings.canDrawOverlays(this)) {
+            stopSelf()
+            return START_NOT_STICKY
+        }
+        val manager = getSystemService(Context.WINDOW_SERVICE) as WindowManager
+        wm = manager
 
-            canvas.drawLine(cue.x, cue.y, target.x, target.y, linePaint)
-            val dx = target.x - cue.x
-            val dy = target.y - cue.y
-            val len = hypot(dx, dy).coerceAtLeast(1f)
-            val endX = target.x + dx / len * 220f
-            val endY = target.y + dy / len * 220f
-            canvas.drawLine(target.x, target.y, endX, endY, targetPaint)
-            canvas.drawCircle(cue.x, cue.y, radius, handlePaint)
-            canvas.drawCircle(target.x, target.y, radius, targetPaint)
-            val dark = Paint(Paint.ANTI_ALIAS_FLAG).apply { color = 0xCC000000.toInt() }
-            canvas.drawCircle(cue.x, cue.y, 9f, dark)
-            canvas.drawText("CUE", cue.x + 32f, cue.y - 18f, labelPaint)
-            canvas.drawText("TARGET", target.x + 32f, target.y - 18f, labelPaint)
+        val cv = AimCanvasView(this)
+        val cp = WindowManager.LayoutParams(
+            WindowManager.LayoutParams.MATCH_PARENT,
+            WindowManager.LayoutParams.MATCH_PARENT,
+            WindowManager.LayoutParams.TYPE_APPLICATION_OVERLAY,
+            canvasFlags(true),
+            PixelFormat.TRANSLUCENT
+        )
+        cp.gravity = Gravity.TOP or Gravity.START
+        cp.alpha = 0.8f // مطلوب في أندرويد 12+ كي يمر اللمس للعبة
+        manager.addView(cv, cp)
+        canvasView = cv
+
+        val pp = WindowManager.LayoutParams(
+            WindowManager.LayoutParams.WRAP_CONTENT,
+            WindowManager.LayoutParams.WRAP_CONTENT,
+            WindowManager.LayoutParams.TYPE_APPLICATION_OVERLAY,
+            WindowManager.LayoutParams.FLAG_NOT_FOCUSABLE,
+            PixelFormat.TRANSLUCENT
+        )
+        pp.gravity = Gravity.TOP or Gravity.START
+        pp.x = 24
+        pp.y = 160
+        val panel = buildPanel(manager, cv, cp, pp)
+        manager.addView(panel, pp)
+        panelView = panel
+        return START_NOT_STICKY
+    }
+
+    private fun buildPanel(
+        manager: WindowManager,
+        cv: AimCanvasView,
+        cp: WindowManager.LayoutParams,
+        pp: WindowManager.LayoutParams
+    ): LinearLayout {
+        val dp = resources.displayMetrics.density
+        val box = LinearLayout(this)
+        box.orientation = LinearLayout.HORIZONTAL
+        box.gravity = Gravity.CENTER_VERTICAL
+        val bgd = GradientDrawable()
+        bgd.setColor(Color.argb(235, 24, 24, 32))
+        bgd.cornerRadius = 24 * dp
+        bgd.setStroke((1 * dp).toInt(), Color.argb(120, 255, 255, 255))
+        box.background = bgd
+        box.setPadding((6 * dp).toInt(), (4 * dp).toInt(), (6 * dp).toInt(), (4 * dp).toInt())
+
+        fun chip(text: String): TextView {
+            val t = TextView(this)
+            t.text = text
+            t.setTextColor(Color.WHITE)
+            t.textSize = 15f
+            t.gravity = Gravity.CENTER
+            t.setPadding((12 * dp).toInt(), (8 * dp).toInt(), (12 * dp).toInt(), (8 * dp).toInt())
+            return t
         }
 
-        override fun onTouchEvent(event: android.view.MotionEvent): Boolean {
-            val x = event.x
-            val y = event.y
-            when (event.action) {
+        // مقبض السحب
+        val handle = chip("≡")
+        var startX = 0
+        var startY = 0
+        var downX = 0f
+        var downY = 0f
+        handle.setOnTouchListener { _, e ->
+            when (e.actionMasked) {
                 MotionEvent.ACTION_DOWN -> {
-                    if (closeRect.contains(x, y)) {
-                        stopSelf()
-                        return true
-                    }
-                    active = if (hypot(x - cue.x, y - cue.y) < hypot(x - target.x, y - target.y)) 1 else 2
-                    return true
+                    startX = pp.x
+                    startY = pp.y
+                    downX = e.rawX
+                    downY = e.rawY
                 }
                 MotionEvent.ACTION_MOVE -> {
-                    if (active == 1) { cue = PointF(x, y); invalidate() }
-                    if (active == 2) { target = PointF(x, y); invalidate() }
-                    return true
+                    pp.x = startX + (e.rawX - downX).toInt()
+                    pp.y = startY + (e.rawY - downY).toInt()
+                    manager.updateViewLayout(box, pp)
                 }
-                MotionEvent.ACTION_UP -> { active = 0; return true }
             }
-            return true
+            true
+        }
+
+        val editBtn = chip("✓ تثبيت")
+        editBtn.setOnClickListener {
+            editing = !editing
+            editBtn.text = if (editing) "✓ تثبيت" else "✎ تعديل"
+            cv.editing = editing
+            cp.flags = canvasFlags(editing)
+            manager.updateViewLayout(cv, cp)
+        }
+
+        val resetBtn = chip("↺")
+        resetBtn.setOnClickListener { cv.resetDefaults() }
+
+        val closeBtn = chip("✕")
+        closeBtn.setOnClickListener { stopSelf() }
+
+        box.addView(handle)
+        box.addView(editBtn)
+        box.addView(resetBtn)
+        box.addView(closeBtn)
+        return box
+    }
+
+    override fun onDestroy() {
+        try {
+            canvasView?.let { wm?.removeView(it) }
+            panelView?.let { wm?.removeView(it) }
+        } catch (e: Exception) {
+        }
+        canvasView = null
+        panelView = null
+        super.onDestroy()
+    }
+}
+
+class TraceResult(val pts: ArrayList<PointF>, val ghost: PointF?, val dx: Float, val dy: Float)
+
+class AimCanvasView(ctx: Context) : View(ctx) {
+
+    var editing = true
+        set(v) {
+            field = v
+            invalidate()
+        }
+
+    private val prefs = ctx.getSharedPreferences("pv", Context.MODE_PRIVATE)
+    private val dp = ctx.resources.displayMetrics.density
+
+    private val cue = PointF()
+    private val target = PointF()
+    private val aim = PointF()
+    private val tl = PointF()
+    private val br = PointF()
+    private val pts = arrayOf(aim, cue, target, tl, br)
+    private val keys = arrayOf("aim", "cue", "tgt", "tl", "br")
+    private var active: PointF? = null
+
+    private val linePaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
+        style = Paint.Style.STROKE
+        strokeCap = Paint.Cap.ROUND
+    }
+    private val fillPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply { style = Paint.Style.FILL }
+    private val strokePaint = Paint(Paint.ANTI_ALIAS_FLAG).apply { style = Paint.Style.STROKE }
+    private val textPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
+        color = Color.WHITE
+        textAlign = Paint.Align.CENTER
+        textSize = 13 * dp
+    }
+
+    override fun onSizeChanged(w: Int, h: Int, ow: Int, oh: Int) {
+        super.onSizeChanged(w, h, ow, oh)
+        if (!load()) resetDefaults()
+    }
+
+    fun resetDefaults() {
+        val w = width.toFloat()
+        val h = height.toFloat()
+        tl.set(w * 0.12f, h * 0.25f)
+        br.set(w * 0.88f, h * 0.75f)
+        cue.set(w * 0.35f, h * 0.6f)
+        target.set(w * 0.6f, h * 0.4f)
+        aim.set(w * 0.55f, h * 0.45f)
+        save()
+        invalidate()
+    }
+
+    private fun save() {
+        val e = prefs.edit()
+        for (i in pts.indices) {
+            e.putFloat(keys[i] + ".x", pts[i].x)
+            e.putFloat(keys[i] + ".y", pts[i].y)
+        }
+        e.apply()
+    }
+
+    private fun load(): Boolean {
+        if (!prefs.contains("cue.x")) return false
+        for (i in pts.indices) {
+            val x = prefs.getFloat(keys[i] + ".x", -1f)
+            val y = prefs.getFloat(keys[i] + ".y", -1f)
+            if (x < 0f || y < 0f || x > width || y > height) return false
+            pts[i].set(x, y)
+        }
+        return true
+    }
+
+    private fun pick(x: Float, y: Float): PointF? {
+        var best: PointF? = null
+        var bd = 60 * dp
+        for (p in pts) {
+            val d = hypot(p.x - x, p.y - y)
+            if (d < bd) {
+                bd = d
+                best = p
+            }
+        }
+        return best
+    }
+
+    override fun onTouchEvent(e: MotionEvent): Boolean {
+        if (!editing) return false
+        when (e.actionMasked) {
+            MotionEvent.ACTION_DOWN -> {
+                active = pick(e.x, e.y)
+                return active != null
+            }
+            MotionEvent.ACTION_MOVE -> {
+                active?.set(e.x, e.y)
+                invalidate()
+            }
+            MotionEvent.ACTION_UP, MotionEvent.ACTION_CANCEL -> {
+                if (active != null) save()
+                active = null
+            }
+        }
+        return true
+    }
+
+    private fun trace(
+        sx: Float, sy: Float, dirX: Float, dirY: Float,
+        maxBounces: Int, bounds: RectF, tgt: PointF?, hitR: Float
+    ): TraceResult {
+        val out = arrayListOf(PointF(sx, sy))
+        var px = sx
+        var py = sy
+        var dx = dirX
+        var dy = dirY
+        for (i in 0..maxBounces) {
+            var tWall = Float.MAX_VALUE
+            var vertical = false
+            if (dx > EPS) {
+                val t = (bounds.right - px) / dx
+                if (t < tWall) { tWall = t; vertical = true }
+            } else if (dx < -EPS) {
+                val t = (bounds.left - px) / dx
+                if (t < tWall) { tWall = t; vertical = true }
+            }
+            if (dy > EPS) {
+                val t = (bounds.bottom - py) / dy
+                if (t < tWall) { tWall = t; vertical = false }
+            } else if (dy < -EPS) {
+                val t = (bounds.top - py) / dy
+                if (t < tWall) { tWall = t; vertical = false }
+            }
+            if (tWall == Float.MAX_VALUE) break
+            if (tWall < 0f) tWall = 0f
+
+            if (tgt != null) {
+                val fx = px - tgt.x
+                val fy = py - tgt.y
+                val b = fx * dx + fy * dy
+                val c = fx * fx + fy * fy - hitR * hitR
+                val disc = b * b - c
+                if (disc >= 0f) {
+                    val t = -b - sqrt(disc)
+                    if (t > 0f && t < tWall) {
+                        val g = PointF(px + dx * t, py + dy * t)
+                        out.add(g)
+                        return TraceResult(out, g, dx, dy)
+                    }
+                }
+            }
+            px += dx * tWall
+            py += dy * tWall
+            out.add(PointF(px, py))
+            if (vertical) dx = -dx else dy = -dy
+        }
+        return TraceResult(out, null, dx, dy)
+    }
+
+    private fun poly(c: Canvas, p: List<PointF>, paint: Paint) {
+        for (i in 0 until p.size - 1) {
+            c.drawLine(p[i].x, p[i].y, p[i + 1].x, p[i + 1].y, paint)
+        }
+    }
+
+    override fun onDraw(c: Canvas) {
+        val r = prefs.getInt("radius", 14) * dp
+        val alpha = prefs.getInt("alpha", 200)
+        val color = prefs.getInt("color", Color.rgb(0, 230, 118))
+        val maxB = prefs.getInt("bounces", 3)
+        val lw = prefs.getInt("width", 3) * dp
+
+        val table = RectF(min(tl.x, br.x), min(tl.y, br.y), max(tl.x, br.x), max(tl.y, br.y))
+
+        if (editing) {
+            strokePaint.color = Color.argb(160, 120, 200, 255)
+            strokePaint.strokeWidth = 2 * dp
+            strokePaint.pathEffect = DashPathEffect(floatArrayOf(14 * dp, 8 * dp), 0f)
+            c.drawRect(table, strokePaint)
+            strokePaint.pathEffect = null
+        }
+
+        val bounds = RectF(table.left + r, table.top + r, table.right - r, table.bottom - r)
+        if (bounds.width() > 10f && bounds.height() > 10f) {
+            val cc = PointF(cue.x.coerceIn(bounds.left, bounds.right), cue.y.coerceIn(bounds.top, bounds.bottom))
+            val tc = PointF(target.x.coerceIn(bounds.left, bounds.right), target.y.coerceIn(bounds.top, bounds.bottom))
+
+            // الكرات
+            fillPaint.color = Color.WHITE
+            fillPaint.alpha = 70
+            c.drawCircle(cc.x, cc.y, r, fillPaint)
+            strokePaint.color = Color.WHITE
+            strokePaint.strokeWidth = 2 * dp
+            c.drawCircle(cc.x, cc.y, r, strokePaint)
+
+            fillPaint.color = Color.rgb(255, 170, 0)
+            fillPaint.alpha = 70
+            c.drawCircle(tc.x, tc.y, r, fillPaint)
+            strokePaint.color = Color.rgb(255, 170, 0)
+            c.drawCircle(tc.x, tc.y, r, strokePaint)
+
+            // خط التصويب
+            val vx = aim.x - cc.x
+            val vy = aim.y - cc.y
+            val len = hypot(vx, vy)
+            if (len > 1f) {
+                val ux = vx / len
+                val uy = vy / len
+
+                linePaint.strokeWidth = lw
+                linePaint.color = color
+                linePaint.alpha = alpha
+                val res = trace(cc.x, cc.y, ux, uy, maxB, bounds, tc, 2 * r)
+                poly(c, res.pts, linePaint)
+
+                val ghost = res.ghost
+                if (ghost != null) {
+                    strokePaint.color = Color.WHITE
+                    strokePaint.alpha = alpha
+                    c.drawCircle(ghost.x, ghost.y, r, strokePaint)
+
+                    var nx = tc.x - ghost.x
+                    var ny = tc.y - ghost.y
+                    val nl = hypot(nx, ny)
+                    if (nl > EPS) {
+                        nx /= nl
+                        ny /= nl
+                        // مسار كرة الهدف
+                        val tr = trace(tc.x, tc.y, nx, ny, maxB, bounds, null, 0f)
+                        linePaint.color = Color.rgb(255, 170, 0)
+                        linePaint.alpha = alpha
+                        poly(c, tr.pts, linePaint)
+
+                        // اتجاه الكرة البيضاء بعد التصادم
+                        val dot = res.dx * nx + res.dy * ny
+                        var tx = res.dx - dot * nx
+                        var ty = res.dy - dot * ny
+                        val tlen = hypot(tx, ty)
+                        if (tlen > 0.05f) {
+                            tx /= tlen
+                            ty /= tlen
+                            linePaint.color = Color.WHITE
+                            linePaint.alpha = alpha / 2
+                            c.drawLine(
+                                ghost.x, ghost.y,
+                                ghost.x + tx * 120 * dp, ghost.y + ty * 120 * dp, linePaint
+                            )
+                        }
+                    }
+                }
+            }
+        }
+
+        if (editing) {
+            fillPaint.color = Color.rgb(255, 82, 82)
+            fillPaint.alpha = 255
+            c.drawCircle(aim.x, aim.y, 12 * dp, fillPaint)
+            c.drawText("توجيه", aim.x, aim.y - 18 * dp, textPaint)
+            c.drawText("أبيض", cue.x, cue.y - 28 * dp, textPaint)
+            c.drawText("هدف", target.x, target.y - 28 * dp, textPaint)
+
+            fillPaint.color = Color.rgb(0, 200, 255)
+            fillPaint.alpha = 255
+            for (p in arrayOf(tl, br)) {
+                c.drawRect(p.x - 10 * dp, p.y - 10 * dp, p.x + 10 * dp, p.y + 10 * dp, fillPaint)
+            }
+            c.drawText("ركن الطاولة", tl.x, tl.y - 16 * dp, textPaint)
+            c.drawText("ركن الطاولة", br.x, br.y + 28 * dp, textPaint)
+            c.drawText("وضع التعديل: حرّك النقاط ثم اضغط ✓ تثبيت", width / 2f, 90 * dp, textPaint)
         }
     }
 }
