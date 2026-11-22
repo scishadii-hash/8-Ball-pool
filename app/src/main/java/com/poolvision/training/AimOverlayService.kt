@@ -593,4 +593,35 @@ class AimCanvasView(ctx: Context) : View(ctx) {
                         linePaint.color = Color.WHITE
                         linePaint.alpha = alpha / 2
                         c.drawLine(ghost.x, ghost.y, ghost.x + tx * sl, ghost.y + ty * sl, linePaint)
-                   
+                   }
+                }
+            }
+        }
+
+        if (editing) {
+            fillPaint.color = Color.rgb(255, 82, 82)
+            fillPaint.alpha = 255
+            c.drawCircle(aimPt.x, aimPt.y, 12 * dp, fillPaint)
+            c.drawText("لفّ", aimPt.x, aimPt.y - 18 * dp, textPaint)
+            c.drawText("أبيض", cue.x, cue.y - 28 * dp, textPaint)
+            for (i in balls.indices) {
+                c.drawText("هدف " + (i + 1), balls[i].x, balls[i].y - 28 * dp, textPaint)
+            }
+
+            fillPaint.color = Color.rgb(0, 200, 255)
+            fillPaint.alpha = 255
+            for (p in arrayOf(tl, br)) {
+                c.drawRect(p.x - 10 * dp, p.y - 10 * dp, p.x + 10 * dp, p.y + 10 * dp, fillPaint)
+            }
+            c.drawText("ركن الطاولة", tl.x, tl.y - 16 * dp, textPaint)
+            c.drawText("ركن الطاولة", br.x, br.y + 28 * dp, textPaint)
+
+            val hint = when (mode) {
+                1 -> "المس مكان الكرة البيضاء"
+                2 -> "المس مكان كل كرة هدف (كل لمسة تضيف كرة)"
+                else -> "اسحب النقاط أو اضغط ⚪ أو ＋ للوضع بلمسة، ثم ✓ تثبيت"
+            }
+            c.drawText(hint, width / 2f, 90 * dp, textPaint)
+        }
+    }
+}
