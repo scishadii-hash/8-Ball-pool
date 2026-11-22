@@ -18,10 +18,14 @@ import android.view.MotionEvent
 import android.view.View
 import android.view.WindowManager
 import android.widget.LinearLayout
+import android.widget.SeekBar
 import android.widget.TextView
+import kotlin.math.atan2
+import kotlin.math.cos
 import kotlin.math.hypot
 import kotlin.math.max
 import kotlin.math.min
+import kotlin.math.sin
 import kotlin.math.sqrt
 
 private const val EPS = 1e-6f
@@ -89,14 +93,13 @@ class AimOverlayService : Service() {
     ): LinearLayout {
         val dp = resources.displayMetrics.density
         val box = LinearLayout(this)
-        box.orientation = LinearLayout.HORIZONTAL
-        box.gravity = Gravity.CENTER_VERTICAL
+        box.orientation = LinearLayout.VERTICAL
         val bgd = GradientDrawable()
         bgd.setColor(Color.argb(235, 24, 24, 32))
-        bgd.cornerRadius = 24 * dp
+        bgd.cornerRadius = 20 * dp
         bgd.setStroke((1 * dp).toInt(), Color.argb(120, 255, 255, 255))
         box.background = bgd
-        box.setPadding((6 * dp).toInt(), (4 * dp).toInt(), (6 * dp).toInt(), (4 * dp).toInt())
+        box.setPadding((6 * dp).toInt(), (4 * dp).toInt(), (6 * dp).toInt(), (6 * dp).toInt())
 
         fun chip(text: String): TextView {
             val t = TextView(this)
@@ -104,9 +107,13 @@ class AimOverlayService : Service() {
             t.setTextColor(Color.WHITE)
             t.textSize = 15f
             t.gravity = Gravity.CENTER
-            t.setPadding((12 * dp).toInt(), (8 * dp).toInt(), (12 * dp).toInt(), (8 * dp).toInt())
+            t.setPadding((10 * dp).toInt(), (8 * dp).toInt(), (10 * dp).toInt(), (8 * dp).toInt())
             return t
         }
+
+        val row = LinearLayout(this)
+        row.orientation = LinearLayout.HORIZONTAL
+        row.gravity = Gravity.CENTER_VERTICAL
 
         val handle = chip("≡")
         var startX = 0
@@ -134,13 +141,23 @@ class AimOverlayService : Service() {
         editBtn.setOnClickListener {
             editing = !editing
             editBtn.text = if (editing) "✓ تثبيت" else "✎ تعديل"
+            cv.mode = 0
             cv.editing = editing
             cp.flags = canvasFlags(editing)
             manager.updateViewLayout(cv, cp)
         }
 
-        val addBtn = chip("＋كرة")
-        addBtn.setOnClickListener { cv.addBall() }
+        val cueBtn = chip("⚪")
+        cueBtn.setOnClickListener {
+            if (!editing) editBtn.performClick()
+            cv.mode = 1
+        }
+
+        val ballBtn = chip("＋")
+        ballBtn.setOnClickListener {
+            if (!editing) editBtn.performClick()
+            cv.mode = 2
+        }
 
         val remBtn = chip("－")
         remBtn.setOnClickListener { cv.removeBall() }
@@ -151,12 +168,38 @@ class AimOverlayService : Service() {
         val closeBtn = chip("✕")
         closeBtn.setOnClickListener { stopSelf() }
 
-        box.addView(handle)
-        box.addView(editBtn)
-        box.addView(addBtn)
-        box.addView(remBtn)
-        box.addView(resetBtn)
-        box.addView(closeBtn)
+        row.addView(handle)
+        row.addView(editBtn)
+        row.addView(cueBtn)
+        row.addView(ballBtn)
+        row.addView(remBtn)
+        row.addView(resetBtn)
+        row.addView(closeBtn)
+
+        val powerRow = LinearLayout(this)
+        powerRow.orientation = LinearLayout.HORIZONTAL
+        powerRow.gravity = Gravity.CENTER_VERTICAL
+        val powerLabel = TextView(this)
+        powerLabel.setTextColor(Color.WHITE)
+        powerLabel.textSize = 13f
+        powerLabel.setPadding((8 * dp).toInt(), 0, (8 * dp).toInt(), 0)
+        powerLabel.text = "قوة " + cv.power + "%"
+        val sb = SeekBar(this)
+        sb.max = 90
+        sb.progress = cv.power - 10
+        sb.setOnSeekBarChangeListener(object : SeekBar.OnSeekBarChangeListener {
+            override fun onProgressChanged(s: SeekBar?, p: Int, fromUser: Boolean) {
+                cv.power = p + 10
+                powerLabel.text = "قوة " + (p + 10) + "%"
+            }
+            override fun onStartTrackingTouch(s: SeekBar?) {}
+            override fun onStopTrackingTouch(s: SeekBar?) {}
+        })
+        powerRow.addView(powerLabel)
+        powerRow.addView(sb, LinearLayout.LayoutParams((190 * dp).toInt(), LinearLayout.LayoutParams.WRAP_CONTENT))
+
+        box.addView(row)
+        box.addView(powerRow)
         return box
     }
 
@@ -177,7 +220,8 @@ class TraceResult(
     val ghost: PointF?,
     val dx: Float,
     val dy: Float,
-    val hit: Int
+    val hit: Int,
+    val left: Float
 )
 
 class AimCanvasView(ctx: Context) : View(ctx) {
@@ -188,11 +232,26 @@ class AimCanvasView(ctx: Context) : View(ctx) {
             invalidate()
         }
 
+    // 0 = عادي، 1 = المس مكان الكرة البيضاء، 2 = المس مكان كرة هدف
+    var mode = 0
+        set(v) {
+            field = v
+            invalidate()
+        }
+
     private val prefs = ctx.getSharedPreferences("pv", Context.MODE_PRIVATE)
     private val dp = ctx.resources.displayMetrics.density
 
+    var power = prefs.getInt("power", 100)
+        set(v) {
+            field = v
+            prefs.edit().putInt("power", v).apply()
+            invalidate()
+        }
+
     private val cue = PointF()
-    private val aim = PointF()
+    private val aimPt = PointF()
+    private var ang = -0.5f
     private val tl = PointF()
     private val br = PointF()
     private val balls = ArrayList<PointF>()
@@ -212,9 +271,14 @@ class AimCanvasView(ctx: Context) : View(ctx) {
 
     private fun tag() = if (width > height) "L" else "P"
 
+    private fun updateAim() {
+        val h = 80 * dp
+        aimPt.set(cue.x + cos(ang) * h, cue.y + sin(ang) * h)
+    }
+
     private fun allPts(): List<PointF> {
         val l = ArrayList<PointF>()
-        l.add(aim)
+        l.add(aimPt)
         l.add(cue)
         l.add(tl)
         l.add(br)
@@ -230,28 +294,21 @@ class AimCanvasView(ctx: Context) : View(ctx) {
     fun resetDefaults() {
         val w = width.toFloat()
         val h = height.toFloat()
+        balls.clear()
         if (w > h) {
             tl.set(w * 0.18f, h * 0.21f)
             br.set(w * 0.82f, h * 0.94f)
-            cue.set(w * 0.35f, h * 0.45f)
-            aim.set(w * 0.50f, h * 0.50f)
-            balls.clear()
-            balls.add(PointF(w * 0.60f, h * 0.55f))
+            cue.set(w * 0.35f, h * 0.55f)
+            ang = -0.45f
+            balls.add(PointF(w * 0.60f, h * 0.45f))
         } else {
             tl.set(w * 0.12f, h * 0.25f)
             br.set(w * 0.88f, h * 0.75f)
             cue.set(w * 0.35f, h * 0.60f)
-            aim.set(w * 0.55f, h * 0.45f)
-            balls.clear()
+            ang = -0.9f
             balls.add(PointF(w * 0.60f, h * 0.40f))
         }
-        save()
-        invalidate()
-    }
-
-    fun addBall() {
-        if (balls.size >= 15) return
-        balls.add(PointF(width * 0.5f, height * 0.5f + balls.size * 10 * dp))
+        updateAim()
         save()
         invalidate()
     }
@@ -267,12 +324,13 @@ class AimCanvasView(ctx: Context) : View(ctx) {
     private fun save() {
         val e = prefs.edit()
         val t = tag()
-        val fixed = arrayOf(aim, cue, tl, br)
-        val names = arrayOf("aim", "cue", "tl", "br")
+        val fixed = arrayOf(cue, tl, br)
+        val names = arrayOf("cue", "tl", "br")
         for (i in fixed.indices) {
             e.putFloat(names[i] + t + ".x", fixed[i].x)
             e.putFloat(names[i] + t + ".y", fixed[i].y)
         }
+        e.putFloat("ang" + t, ang)
         e.putInt("n" + t, balls.size)
         for (i in balls.indices) {
             e.putFloat("b" + i + t + ".x", balls[i].x)
@@ -283,15 +341,16 @@ class AimCanvasView(ctx: Context) : View(ctx) {
 
     private fun load(): Boolean {
         val t = tag()
-        if (!prefs.contains("n" + t)) return false
-        val fixed = arrayOf(aim, cue, tl, br)
-        val names = arrayOf("aim", "cue", "tl", "br")
+        if (!prefs.contains("ang" + t)) return false
+        val fixed = arrayOf(cue, tl, br)
+        val names = arrayOf("cue", "tl", "br")
         for (i in fixed.indices) {
             val x = prefs.getFloat(names[i] + t + ".x", -1f)
             val y = prefs.getFloat(names[i] + t + ".y", -1f)
             if (x < 0f || y < 0f || x > width || y > height) return false
             fixed[i].set(x, y)
         }
+        ang = prefs.getFloat("ang" + t, -0.5f)
         val n = prefs.getInt("n" + t, 0)
         if (n < 1) return false
         balls.clear()
@@ -301,12 +360,13 @@ class AimCanvasView(ctx: Context) : View(ctx) {
             if (x < 0f || y < 0f || x > width || y > height) return false
             balls.add(PointF(x, y))
         }
+        updateAim()
         return true
     }
 
     private fun pick(x: Float, y: Float): PointF? {
         var best: PointF? = null
-        var bd = 60 * dp
+        var bd = 50 * dp
         for (p in allPts()) {
             val d = hypot(p.x - x, p.y - y)
             if (d < bd) {
@@ -321,12 +381,35 @@ class AimCanvasView(ctx: Context) : View(ctx) {
         if (!editing) return false
         when (e.actionMasked) {
             MotionEvent.ACTION_DOWN -> {
-                active = pick(e.x, e.y)
-                return active != null
+                var p = pick(e.x, e.y)
+                if (p == null && mode == 1) {
+                    cue.set(e.x, e.y)
+                    updateAim()
+                    mode = 0
+                    p = cue
+                } else if (p == null && mode == 2) {
+                    if (balls.size < 15) {
+                        val nb = PointF(e.x, e.y)
+                        balls.add(nb)
+                        p = nb
+                    }
+                }
+                active = p
+                invalidate()
+                return p != null
             }
             MotionEvent.ACTION_MOVE -> {
-                active?.set(e.x, e.y)
-                invalidate()
+                val a = active
+                if (a != null) {
+                    if (a === aimPt) {
+                        ang = atan2(e.y - cue.y, e.x - cue.x)
+                        updateAim()
+                    } else {
+                        a.set(e.x, e.y)
+                        if (a === cue) updateAim()
+                    }
+                    invalidate()
+                }
             }
             MotionEvent.ACTION_UP, MotionEvent.ACTION_CANCEL -> {
                 if (active != null) save()
@@ -338,13 +421,14 @@ class AimCanvasView(ctx: Context) : View(ctx) {
 
     private fun trace(
         sx: Float, sy: Float, dirX: Float, dirY: Float,
-        maxBounces: Int, bounds: RectF, tgts: List<PointF>, hitR: Float
+        maxBounces: Int, bounds: RectF, tgts: List<PointF>, hitR: Float, budget0: Float
     ): TraceResult {
         val out = arrayListOf(PointF(sx, sy))
         var px = sx
         var py = sy
         var dx = dirX
         var dy = dirY
+        var budget = budget0
         for (i in 0..maxBounces) {
             var tWall = Float.MAX_VALUE
             var vertical = false
@@ -381,24 +465,42 @@ class AimCanvasView(ctx: Context) : View(ctx) {
                     }
                 }
             }
+
+            val tHit = if (bestI >= 0) bestT else tWall
+            if (budget <= tHit) {
+                out.add(PointF(px + dx * budget, py + dy * budget))
+                return TraceResult(out, null, dx, dy, -1, 0f)
+            }
             if (bestI >= 0) {
                 val g = PointF(px + dx * bestT, py + dy * bestT)
                 out.add(g)
-                return TraceResult(out, g, dx, dy, bestI)
+                return TraceResult(out, g, dx, dy, bestI, budget - bestT)
             }
 
+            budget -= tWall
             px += dx * tWall
             py += dy * tWall
             out.add(PointF(px, py))
             if (vertical) dx = -dx else dy = -dy
         }
-        return TraceResult(out, null, dx, dy, -1)
+        return TraceResult(out, null, dx, dy, -1, budget)
     }
 
     private fun poly(c: Canvas, p: List<PointF>, paint: Paint) {
         for (i in 0 until p.size - 1) {
             c.drawLine(p[i].x, p[i].y, p[i + 1].x, p[i + 1].y, paint)
         }
+    }
+
+    private fun arrowHead(c: Canvas, p: List<PointF>, paint: Paint) {
+        if (p.size < 2) return
+        val a = p[p.size - 2]
+        val b = p[p.size - 1]
+        if (hypot(b.x - a.x, b.y - a.y) < 4f) return
+        val base = atan2(b.y - a.y, b.x - a.x) + Math.PI.toFloat()
+        val s = 14 * dp
+        c.drawLine(b.x, b.y, b.x + cos(base + 0.5f) * s, b.y + sin(base + 0.5f) * s, paint)
+        c.drawLine(b.x, b.y, b.x + cos(base - 0.5f) * s, b.y + sin(base - 0.5f) * s, paint)
     }
 
     override fun onDraw(c: Canvas) {
@@ -449,74 +551,46 @@ class AimCanvasView(ctx: Context) : View(ctx) {
                 c.drawCircle(b.x, b.y, r, strokePaint)
             }
 
-            val vx = aim.x - cc.x
-            val vy = aim.y - cc.y
-            val len = hypot(vx, vy)
-            if (len > 1f) {
-                val ux = vx / len
-                val uy = vy / len
+            val ux = cos(ang)
+            val uy = sin(ang)
+            val maxLen = hypot(table.width(), table.height()) * 2f
+            val budget = maxLen * power / 100f
 
-                linePaint.strokeWidth = lw
-                linePaint.color = color
-                linePaint.alpha = alpha
-                val res = trace(cc.x, cc.y, ux, uy, maxB, bounds, bc, 2 * r)
-                poly(c, res.pts, linePaint)
+            linePaint.strokeWidth = lw
+            linePaint.color = color
+            linePaint.alpha = alpha
+            val res = trace(cc.x, cc.y, ux, uy, maxB, bounds, bc, 2 * r, budget)
+            poly(c, res.pts, linePaint)
+            if (res.hit < 0) arrowHead(c, res.pts, linePaint)
 
-                val ghost = res.ghost
-                if (ghost != null && res.hit >= 0) {
-                    val tc = bc[res.hit]
-                    strokePaint.color = Color.WHITE
-                    strokePaint.alpha = alpha
-                    c.drawCircle(ghost.x, ghost.y, r, strokePaint)
+            val ghost = res.ghost
+            if (ghost != null && res.hit >= 0) {
+                val tc = bc[res.hit]
+                strokePaint.color = Color.WHITE
+                strokePaint.alpha = alpha
+                c.drawCircle(ghost.x, ghost.y, r, strokePaint)
 
-                    var nx = tc.x - ghost.x
-                    var ny = tc.y - ghost.y
-                    val nl = hypot(nx, ny)
-                    if (nl > EPS) {
-                        nx /= nl
-                        ny /= nl
-                        val tr = trace(tc.x, tc.y, nx, ny, maxB, bounds, emptyList(), 0f)
-                        linePaint.color = Color.rgb(255, 170, 0)
-                        linePaint.alpha = alpha
-                        poly(c, tr.pts, linePaint)
+                var nx = tc.x - ghost.x
+                var ny = tc.y - ghost.y
+                val nl = hypot(nx, ny)
+                if (nl > EPS) {
+                    nx /= nl
+                    ny /= nl
+                    val tr = trace(tc.x, tc.y, nx, ny, maxB, bounds, emptyList(), 0f, res.left * 0.8f)
+                    linePaint.color = Color.rgb(255, 170, 0)
+                    linePaint.alpha = alpha
+                    poly(c, tr.pts, linePaint)
+                    arrowHead(c, tr.pts, linePaint)
 
-                        val dot = res.dx * nx + res.dy * ny
-                        var tx = res.dx - dot * nx
-                        var ty = res.dy - dot * ny
-                        val tlen = hypot(tx, ty)
-                        if (tlen > 0.05f) {
-                            tx /= tlen
-                            ty /= tlen
-                            linePaint.color = Color.WHITE
-                            linePaint.alpha = alpha / 2
-                            c.drawLine(
-                                ghost.x, ghost.y,
-                                ghost.x + tx * 120 * dp, ghost.y + ty * 120 * dp, linePaint
-                            )
-                        }
-                    }
-                }
-            }
-        }
-
-        if (editing) {
-            fillPaint.color = Color.rgb(255, 82, 82)
-            fillPaint.alpha = 255
-            c.drawCircle(aim.x, aim.y, 12 * dp, fillPaint)
-            c.drawText("توجيه", aim.x, aim.y - 18 * dp, textPaint)
-            c.drawText("أبيض", cue.x, cue.y - 28 * dp, textPaint)
-            for (i in balls.indices) {
-                c.drawText("هدف " + (i + 1), balls[i].x, balls[i].y - 28 * dp, textPaint)
-            }
-
-            fillPaint.color = Color.rgb(0, 200, 255)
-            fillPaint.alpha = 255
-            for (p in arrayOf(tl, br)) {
-                c.drawRect(p.x - 10 * dp, p.y - 10 * dp, p.x + 10 * dp, p.y + 10 * dp, fillPaint)
-            }
-            c.drawText("ركن الطاولة", tl.x, tl.y - 16 * dp, textPaint)
-            c.drawText("ركن الطاولة", br.x, br.y + 28 * dp, textPaint)
-            c.drawText("وضع التعديل: حرّك النقاط ثم اضغط ✓ تثبيت", width / 2f, 90 * dp, textPaint)
-        }
-    }
-}
+                    val dot = res.dx * nx + res.dy * ny
+                    var tx = res.dx - dot * nx
+                    var ty = res.dy - dot * ny
+                    val tlen = hypot(tx, ty)
+                    if (tlen > 0.05f) {
+                        tx /= tlen
+                        ty /= tlen
+                        val sl = min(res.left * 0.3f, 120 * dp)
+                        linePaint.color = Color.WHITE
+                        linePaint.alpha = alpha / 2
+                        c.drawLine(ghost.x, ghost.y, ghost.x + tx * sl, ghost.y + ty * sl, linePaint)
+                   
